@@ -5,8 +5,35 @@
 //
 // The key is stored as a Worker secret named GEMINI_API_KEY (never in this file):
 //   npx wrangler secret put GEMINI_API_KEY
+//
+// GET /test runs a built-in self-test: it sends a tiny embedded image to
+// Gemini and returns the raw result, so you can see exactly what Gemini
+// says without involving the app or a camera.
 
 const MODEL = "gemini-2.5-flash";
+
+// 1x1 red pixel PNG, ~70 bytes. Used only by /test.
+const TEST_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+async function callGemini(env, parts, generationConfig) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+  const body = { contents: [{ parts }] };
+  if (generationConfig) body.generationConfig = generationConfig;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  const raw = await resp.text();
+  let data = null;
+  try { data = JSON.parse(raw); } catch (e) {}
+  return { resp, raw, data };
+}
 
 export default {
   async fetch(request, env) {
@@ -19,6 +46,34 @@ export default {
     };
 
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+
+    if (request.method === "GET") {
+      const url = new URL(request.url);
+      if (url.pathname === "/test") {
+        if (!env.GEMINI_API_KEY) {
+          return json({ selftest: "FAIL", reason: "GEMINI_API_KEY secret is not set on this Worker" }, 200, cors);
+        }
+        try {
+          const { resp, raw } = await callGemini(env, [
+            { text: "What color is this image? Answer in one word." },
+            { inline_data: { mime_type: "image/png", data: TEST_PNG } },
+          ]);
+          return json({
+            selftest: resp.ok ? "OK" : "FAIL",
+            model: MODEL,
+            keyLength: env.GEMINI_API_KEY.length,
+            geminiStatus: resp.status,
+            geminiStatusText: resp.statusText,
+            geminiContentType: resp.headers.get("content-type"),
+            geminiBodyFirst800: raw.slice(0, 800),
+          }, 200, cors);
+        } catch (err) {
+          return json({ selftest: "FAIL", reason: "fetch to Gemini threw: " + String(err) }, 200, cors);
+        }
+      }
+      return json({ error: "Send a POST request (or GET /test for a self-test)." }, 405, cors);
+    }
+
     if (request.method !== "POST") {
       return json({ error: "Send a POST request." }, 405, cors);
     }
@@ -40,35 +95,24 @@ export default {
     }
 
     try {
-      const url =
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
-
-      const body = {
-        contents: [{
-          parts: [
-            { text: prompt || "Extract all the text from this image exactly as written. Return only the extracted text." },
-            { inline_data: { mime_type: mimeType || "image/jpeg", data: image } },
-          ],
-        }],
-      };
-
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": env.GEMINI_API_KEY,
-        },
-        body: JSON.stringify(body),
-      });
-
-      const raw = await resp.text();
-      let data = null;
-      try { data = JSON.parse(raw); } catch (e) {}
+      const ANALYZE_PROMPT = [
+        "Analyze this photo of study material (worksheet, notes, textbook page, or slides).",
+        "Respond with JSON only, exactly matching this schema:",
+        '{"extractedText": string, "summary": string, "subjects": [{"subject": string, "note": string}]}',
+        "- extractedText: all text visible in the image, exactly as written",
+        "- summary: 1-2 friendly sentences (addressing the student as you) about what this material covers and what to focus on",
+        "- subjects: 1-4 detected subject areas. subject is a short label like Biology worksheet or Algebra notes. note is one line of detail such as the topic and roughly how many questions.",
+        'If the image contains no readable study content, return {"extractedText":"","summary":"","subjects":[]}',
+      ].join("\n");
+      const { resp, raw, data } = await callGemini(env, [
+        { text: prompt || ANALYZE_PROMPT },
+        { inline_data: { mime_type: mimeType || "image/jpeg", data: image } },
+      ], { response_mime_type: "application/json" });
 
       if (!resp.ok) {
         const detail = data && data.error && data.error.message
           ? data.error.message
-          : (raw ? raw.slice(0, 200) : "no detail");
+          : (raw ? raw.slice(0, 200) : "empty body, statusText=" + resp.statusText + ", content-type=" + (resp.headers.get("content-type") || "none"));
         return json({ error: `Gemini rejected the request (HTTP ${resp.status}): ${detail}` }, 502, cors);
       }
       if (!data) {
@@ -81,11 +125,23 @@ export default {
         return json({ error: block ? `Gemini declined to process the image (${block}).` : "Gemini returned no result for this image." }, 502, cors);
       }
 
-      const text = (cand.content && cand.content.parts || [])
+      const modelText = (cand.content && cand.content.parts || [])
         .map((p) => p.text || "")
         .join("");
 
-      return json({ text }, 200, cors);
+      // The model was asked for JSON; parse it and pass structure through.
+      // If parsing fails, fall back to treating its output as plain text so
+      // the app still gets something usable.
+      let parsed = null;
+      try { parsed = JSON.parse(modelText); } catch (e) {}
+      if (parsed && typeof parsed.extractedText === "string") {
+        return json({
+          text: parsed.extractedText,
+          summary: typeof parsed.summary === "string" ? parsed.summary : "",
+          subjects: Array.isArray(parsed.subjects) ? parsed.subjects.slice(0, 4) : [],
+        }, 200, cors);
+      }
+      return json({ text: modelText }, 200, cors);
     } catch (err) {
       return json({ error: "Worker error: " + String(err) }, 500, cors);
     }
