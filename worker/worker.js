@@ -16,16 +16,18 @@ const MODEL = "gemini-2.5-flash";
 const TEST_PNG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-async function callGemini(env, parts) {
+async function callGemini(env, parts, generationConfig) {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+  const body = { contents: [{ parts }] };
+  if (generationConfig) body.generationConfig = generationConfig;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": env.GEMINI_API_KEY,
     },
-    body: JSON.stringify({ contents: [{ parts }] }),
+    body: JSON.stringify(body),
   });
   const raw = await resp.text();
   let data = null;
@@ -93,10 +95,19 @@ export default {
     }
 
     try {
+      const ANALYZE_PROMPT = [
+        "Analyze this photo of study material (worksheet, notes, textbook page, or slides).",
+        "Respond with JSON only, exactly matching this schema:",
+        '{"extractedText": string, "summary": string, "subjects": [{"subject": string, "note": string}]}',
+        "- extractedText: all text visible in the image, exactly as written",
+        "- summary: 1-2 friendly sentences (addressing the student as you) about what this material covers and what to focus on",
+        "- subjects: 1-4 detected subject areas. subject is a short label like Biology worksheet or Algebra notes. note is one line of detail such as the topic and roughly how many questions.",
+        'If the image contains no readable study content, return {"extractedText":"","summary":"","subjects":[]}',
+      ].join("\n");
       const { resp, raw, data } = await callGemini(env, [
-        { text: prompt || "Extract all the text from this image exactly as written. Return only the extracted text." },
+        { text: prompt || ANALYZE_PROMPT },
         { inline_data: { mime_type: mimeType || "image/jpeg", data: image } },
-      ]);
+      ], { response_mime_type: "application/json" });
 
       if (!resp.ok) {
         const detail = data && data.error && data.error.message
@@ -114,11 +125,23 @@ export default {
         return json({ error: block ? `Gemini declined to process the image (${block}).` : "Gemini returned no result for this image." }, 502, cors);
       }
 
-      const text = (cand.content && cand.content.parts || [])
+      const modelText = (cand.content && cand.content.parts || [])
         .map((p) => p.text || "")
         .join("");
 
-      return json({ text }, 200, cors);
+      // The model was asked for JSON; parse it and pass structure through.
+      // If parsing fails, fall back to treating its output as plain text so
+      // the app still gets something usable.
+      let parsed = null;
+      try { parsed = JSON.parse(modelText); } catch (e) {}
+      if (parsed && typeof parsed.extractedText === "string") {
+        return json({
+          text: parsed.extractedText,
+          summary: typeof parsed.summary === "string" ? parsed.summary : "",
+          subjects: Array.isArray(parsed.subjects) ? parsed.subjects.slice(0, 4) : [],
+        }, 200, cors);
+      }
+      return json({ text: modelText }, 200, cors);
     } catch (err) {
       return json({ error: "Worker error: " + String(err) }, 500, cors);
     }
