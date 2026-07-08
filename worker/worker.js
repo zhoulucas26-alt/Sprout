@@ -16,6 +16,33 @@ const MODEL = "gemini-2.5-flash";
 const TEST_PNG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
+// Canonical school-subject categories. Gemini is asked to classify into
+// exactly these; the frontend maps each one to a fixed color so a subject
+// always looks the same across scans.
+const SUBJECT_CATEGORIES = [
+  "Math", "Biology", "Chemistry", "Physics", "English", "History",
+  "Geography", "Computer Science", "Foreign Language", "Arts", "Other",
+];
+
+// Keeps only subjects Gemini could confidently map to a known category,
+// normalizes casing to the canonical spelling, and drops duplicates.
+function normalizeSubjects(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    if (!item || typeof item.subject !== "string") continue;
+    const match = SUBJECT_CATEGORIES.find(
+      (c) => c.toLowerCase() === item.subject.trim().toLowerCase()
+    );
+    if (!match || seen.has(match)) continue;
+    seen.add(match);
+    out.push({ subject: match, note: typeof item.note === "string" ? item.note.trim() : "" });
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
 async function callGemini(env, parts, generationConfig) {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
@@ -101,8 +128,11 @@ export default {
         '{"extractedText": string, "summary": string, "subjects": [{"subject": string, "note": string}]}',
         "- extractedText: all text visible in the image, exactly as written",
         "- summary: 1-2 friendly sentences (addressing the student as you) about what this material covers and what to focus on",
-        "- subjects: 1-4 detected subject areas. subject is a short label like Biology worksheet or Algebra notes. note is one line of detail such as the topic and roughly how many questions.",
-        'If the image contains no readable study content, return {"extractedText":"","summary":"","subjects":[]}',
+        "- subjects: 1-4 school-subject categories this material belongs to.",
+        `  Each "subject" must be exactly one of: ${SUBJECT_CATEGORIES.join(", ")}.`,
+        '  Use "Other" only if it truly fits none of the rest.',
+        '  "note" is one short line naming the specific topic (e.g. "Cell structure", "Quadratic equations") and roughly how many questions/items.',
+        'If you cannot confidently identify any school subject in the image at all, return {"extractedText":"","summary":"","subjects":[]}',
       ].join("\n");
       const { resp, raw, data } = await callGemini(env, [
         { text: prompt || ANALYZE_PROMPT },
@@ -138,7 +168,7 @@ export default {
         return json({
           text: parsed.extractedText,
           summary: typeof parsed.summary === "string" ? parsed.summary : "",
-          subjects: Array.isArray(parsed.subjects) ? parsed.subjects.slice(0, 4) : [],
+          subjects: normalizeSubjects(parsed.subjects),
         }, 200, cors);
       }
       return json({ text: modelText }, 200, cors);
