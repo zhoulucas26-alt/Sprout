@@ -73,10 +73,10 @@ async function callGemini(env, parts, generationConfig) {
 
 export default {
   async fetch(request, env) {
-    // CORS. "*" is convenient for a demo. For production, lock this to your
-    // site's origin, e.g. "https://zhoulucas26-alt.github.io".
+    // CORS locked to the Pages origin - the Origin header browsers send is
+    // just scheme+host, so this covers the site regardless of subpath.
     const cors = {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": "https://zhoulucas26-alt.github.io",
       "Access-Control-Allow-Methods": "POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     };
