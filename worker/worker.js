@@ -25,7 +25,8 @@ const SUBJECT_CATEGORIES = [
 ];
 
 // Keeps only subjects Gemini could confidently map to a known category,
-// normalizes casing to the canonical spelling, and drops duplicates.
+// normalizes casing to the canonical spelling, drops duplicates, and pulls
+// through the per-subject study details used to build the actual plan.
 function normalizeSubjects(list) {
   if (!Array.isArray(list)) return [];
   const seen = new Set();
@@ -37,7 +38,15 @@ function normalizeSubjects(list) {
     );
     if (!match || seen.has(match)) continue;
     seen.add(match);
-    out.push({ subject: match, note: typeof item.note === "string" ? item.note.trim() : "" });
+    const tasks = Array.isArray(item.tasks)
+      ? item.tasks.filter((t) => typeof t === "string" && t.trim()).map((t) => t.trim()).slice(0, 4)
+      : [];
+    out.push({
+      subject: match,
+      topic: typeof item.topic === "string" ? item.topic.trim() : "",
+      how: typeof item.how === "string" ? item.how.trim() : "",
+      tasks,
+    });
     if (out.length >= 4) break;
   }
   return out;
@@ -123,16 +132,18 @@ export default {
 
     try {
       const ANALYZE_PROMPT = [
-        "Analyze this photo of study material (worksheet, notes, textbook page, or slides).",
+        "You are checking whether a photo is school study material (a worksheet, homework, class notes, a textbook page, or slides) and, if it is, building a study plan from it.",
         "Respond with JSON only, exactly matching this schema:",
-        '{"extractedText": string, "summary": string, "subjects": [{"subject": string, "note": string}]}',
-        "- extractedText: all text visible in the image, exactly as written",
-        "- summary: 1-2 friendly sentences (addressing the student as you) about what this material covers and what to focus on",
-        "- subjects: 1-4 school-subject categories this material belongs to.",
-        `  Each "subject" must be exactly one of: ${SUBJECT_CATEGORIES.join(", ")}.`,
-        '  Use "Other" only if it truly fits none of the rest.',
-        '  "note" is one short line naming the specific topic (e.g. "Cell structure", "Quadratic equations") and roughly how many questions/items.',
-        'If you cannot confidently identify any school subject in the image at all, return {"extractedText":"","summary":"","subjects":[]}',
+        '{"extractedText": string, "summary": string, "subjects": [{"subject": string, "topic": string, "how": string, "tasks": [string]}]}',
+        "- extractedText: all text visible in the image, exactly as written. Empty string if there is no legible text.",
+        "- summary: 1-2 friendly sentences (addressing the student as you) about what this material covers and what to focus on. Empty string if this is not study material.",
+        "- subjects: 1-4 entries, ONLY if this is genuinely school/study material tied to an actual academic subject.",
+        `  "subject" must be exactly one of: ${SUBJECT_CATEGORIES.join(", ")}. Use "Other" only if it is study material but truly fits none of the rest.`,
+        '  "topic" is a short, specific topic drawn from the real content (e.g. "Photosynthesis", "Quadratic equations"), not a generic label.',
+        '  "how" is one sentence on the best way to study this exact material (e.g. active recall, worked examples, timed practice), based on what it actually contains.',
+        '  "tasks" is 2-4 short, specific, actionable study tasks that reference the real questions/content in the image (e.g. "Answer Q1-6 on organelle functions"). Do not invent tasks the image does not support.',
+        "Do NOT force a subject onto unrelated content. If the photo is not school study material at all (a random object, a person, a receipt, a meme, an unrelated document, etc.) or you cannot confidently tie it to any school subject, return exactly:",
+        '{"extractedText":"","summary":"","subjects":[]}',
       ].join("\n");
       const { resp, raw, data } = await callGemini(env, [
         { text: prompt || ANALYZE_PROMPT },
