@@ -7,21 +7,23 @@
 //   { mode: "solve", image: "<base64>", mimeType: "image/jpeg" }
 // and gets back { question, answer, steps: [...] } or { error }.
 //
-// Scan/OCR uses Gemini. Solve uses Meta's Llama API (a separate key) per
-// explicit request to use Meta's model for that feature.
+// Scan/OCR uses Gemini. Solve uses Meta's Llama 4 model (a separate key)
+// per explicit request to use Meta's model for that feature. Meta's own
+// Llama API isn't available in every region, so this calls Llama 4
+// hosted on Groq instead - same underlying Meta model, different host.
 //
 // Keys are stored as Worker secrets (never in this file):
 //   npx wrangler secret put GEMINI_API_KEY
-//   npx wrangler secret put LLAMA_API_KEY   (from https://llama.developer.meta.com/)
+//   npx wrangler secret put GROQ_API_KEY   (from https://console.groq.com/keys)
 //
 // GET /test runs a built-in self-test against Gemini (the scan flow).
-// GET /test?provider=llama runs the same kind of self-test against Meta's
-// Llama API (the solve flow), so you can see exactly what each service
-// says without involving the app or a camera.
+// GET /test?provider=groq runs the same kind of self-test against Groq
+// (the solve flow), so you can see exactly what each service says
+// without involving the app or a camera.
 
 const MODEL = "gemini-2.5-flash";
-const LLAMA_MODEL = "Llama-4-Maverick-17B-128E-Instruct-FP8";
-const LLAMA_API_URL = "https://api.llama.com/v1/chat/completions";
+const GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct";
+const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 // 1x1 red pixel PNG, ~70 bytes. Used only by /test.
 const TEST_PNG =
@@ -82,9 +84,9 @@ async function callGemini(env, parts, generationConfig) {
   return { resp, raw, data };
 }
 
-// Meta's Llama API is OpenAI-compatible: chat completions with an
-// image_url content part for vision input, Bearer auth.
-async function callLlama(env, textPrompt, image, mimeType) {
+// Groq's API is OpenAI-compatible: chat completions with an image_url
+// content part for vision input, Bearer auth.
+async function callGroq(env, textPrompt, image, mimeType) {
   const content = [{ type: "text", text: textPrompt }];
   if (image) {
     content.push({
@@ -92,14 +94,14 @@ async function callLlama(env, textPrompt, image, mimeType) {
       image_url: { url: `data:${mimeType || "image/jpeg"};base64,${image}` },
     });
   }
-  const resp = await fetch(LLAMA_API_URL, {
+  const resp = await fetch(GROQ_API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${env.LLAMA_API_KEY}`,
+      "Authorization": `Bearer ${env.GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: LLAMA_MODEL,
+      model: GROQ_MODEL,
       messages: [{ role: "user", content }],
       response_format: { type: "json_object" },
     }),
@@ -111,9 +113,7 @@ async function callLlama(env, textPrompt, image, mimeType) {
 }
 
 // Pulls the model's text out of an OpenAI-shaped chat completion response.
-// Meta's Llama API has used slightly different response shapes across
-// versions, so this checks the common ones defensively.
-function extractLlamaText(data) {
+function extractGroqText(data) {
   if (!data) return "";
   const choice = data.choices && data.choices[0];
   if (choice) {
@@ -123,7 +123,6 @@ function extractLlamaText(data) {
     }
     if (typeof choice.text === "string") return choice.text;
   }
-  if (data.completion_message?.content?.text) return data.completion_message.content.text;
   return "";
 }
 
@@ -141,23 +140,23 @@ export default {
 
     if (request.method === "GET") {
       const url = new URL(request.url);
-      if (url.pathname === "/test" && url.searchParams.get("provider") === "llama") {
-        if (!env.LLAMA_API_KEY) {
-          return json({ selftest: "FAIL", reason: "LLAMA_API_KEY secret is not set on this Worker" }, 200, cors);
+      if (url.pathname === "/test" && url.searchParams.get("provider") === "groq") {
+        if (!env.GROQ_API_KEY) {
+          return json({ selftest: "FAIL", reason: "GROQ_API_KEY secret is not set on this Worker" }, 200, cors);
         }
         try {
-          const { resp, raw } = await callLlama(env, 'Reply with exactly this JSON and nothing else: {"ok":true}');
+          const { resp, raw } = await callGroq(env, 'Reply with exactly this JSON and nothing else: {"ok":true}');
           return json({
             selftest: resp.ok ? "OK" : "FAIL",
-            model: LLAMA_MODEL,
-            keyLength: env.LLAMA_API_KEY.length,
-            llamaStatus: resp.status,
-            llamaStatusText: resp.statusText,
-            llamaContentType: resp.headers.get("content-type"),
-            llamaBodyFirst800: raw.slice(0, 800),
+            model: GROQ_MODEL,
+            keyLength: env.GROQ_API_KEY.length,
+            groqStatus: resp.status,
+            groqStatusText: resp.statusText,
+            groqContentType: resp.headers.get("content-type"),
+            groqBodyFirst800: raw.slice(0, 800),
           }, 200, cors);
         } catch (err) {
-          return json({ selftest: "FAIL", reason: "fetch to Llama threw: " + String(err) }, 200, cors);
+          return json({ selftest: "FAIL", reason: "fetch to Groq threw: " + String(err) }, 200, cors);
         }
       }
       if (url.pathname === "/test") {
@@ -182,7 +181,7 @@ export default {
           return json({ selftest: "FAIL", reason: "fetch to Gemini threw: " + String(err) }, 200, cors);
         }
       }
-      return json({ error: "Send a POST request (or GET /test, or GET /test?provider=llama, for a self-test)." }, 405, cors);
+      return json({ error: "Send a POST request (or GET /test, or GET /test?provider=groq, for a self-test)." }, 405, cors);
     }
 
     if (request.method !== "POST") {
@@ -269,11 +268,11 @@ export default {
 };
 
 // "Solve a question" - takes a photo of a single question a student is
-// stuck on, asks Meta's Llama API to identify it and solve it with a
-// short step-by-step explanation.
+// stuck on, asks Meta's Llama 4 (hosted on Groq) to identify it and solve
+// it with a short step-by-step explanation.
 async function handleSolve(env, image, mimeType, cors) {
-  if (!env.LLAMA_API_KEY) {
-    return json({ error: "Server misconfigured: the LLAMA_API_KEY secret is not set on this Worker. Run: npx wrangler secret put LLAMA_API_KEY, then redeploy." }, 500, cors);
+  if (!env.GROQ_API_KEY) {
+    return json({ error: "Server misconfigured: the GROQ_API_KEY secret is not set on this Worker. Run: npx wrangler secret put GROQ_API_KEY, then redeploy." }, 500, cors);
   }
 
   const SOLVE_PROMPT = [
@@ -288,19 +287,19 @@ async function handleSolve(env, image, mimeType, cors) {
   ].join("\n");
 
   try {
-    const { resp, raw, data } = await callLlama(env, SOLVE_PROMPT, image, mimeType || "image/jpeg");
+    const { resp, raw, data } = await callGroq(env, SOLVE_PROMPT, image, mimeType || "image/jpeg");
 
     if (!resp.ok) {
       const detail = data && data.error && (data.error.message || data.error)
         ? (data.error.message || JSON.stringify(data.error))
         : (raw ? raw.slice(0, 200) : "empty body, statusText=" + resp.statusText);
-      return json({ error: `Llama rejected the request (HTTP ${resp.status}): ${detail}` }, 502, cors);
+      return json({ error: `Groq rejected the request (HTTP ${resp.status}): ${detail}` }, 502, cors);
     }
     if (!data) {
-      return json({ error: `Llama returned an unreadable reply: ${raw.slice(0, 200)}` }, 502, cors);
+      return json({ error: `Groq returned an unreadable reply: ${raw.slice(0, 200)}` }, 502, cors);
     }
 
-    const modelText = extractLlamaText(data);
+    const modelText = extractGroqText(data);
     let parsed = null;
     try { parsed = JSON.parse(modelText); } catch (e) {}
 
@@ -310,7 +309,7 @@ async function handleSolve(env, image, mimeType, cors) {
         : [];
       return json({ question: parsed.question.trim(), answer: parsed.answer.trim(), steps }, 200, cors);
     }
-    return json({ error: `Llama's reply didn't match the expected format: ${modelText.slice(0, 200)}` }, 502, cors);
+    return json({ error: `Groq's reply didn't match the expected format: ${modelText.slice(0, 200)}` }, 502, cors);
   } catch (err) {
     return json({ error: "Worker error while solving: " + String(err) }, 500, cors);
   }
