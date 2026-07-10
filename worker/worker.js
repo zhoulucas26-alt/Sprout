@@ -1,16 +1,27 @@
-// Sprout OCR proxy (Cloudflare Worker)
-// Keeps the Gemini API key server-side. The browser sends
+// Sprout OCR + Solve proxy (Cloudflare Worker)
+// Keeps API keys server-side. The browser sends
 //   { image: "<base64>", mimeType: "image/jpeg", prompt?: "..." }
-// and gets back { text: "<extracted text>" } or { error: "<what went wrong>" }.
+// for the study-plan scan flow, and gets back
+//   { text, summary, subjects } or { error }.
+// For the "Solve a question" flow it sends
+//   { mode: "solve", image: "<base64>", mimeType: "image/jpeg" }
+// and gets back { question, answer, steps: [...] } or { error }.
 //
-// The key is stored as a Worker secret named GEMINI_API_KEY (never in this file):
+// Scan/OCR uses Gemini. Solve uses Meta's Llama API (a separate key) per
+// explicit request to use Meta's model for that feature.
+//
+// Keys are stored as Worker secrets (never in this file):
 //   npx wrangler secret put GEMINI_API_KEY
+//   npx wrangler secret put LLAMA_API_KEY   (from https://llama.developer.meta.com/)
 //
-// GET /test runs a built-in self-test: it sends a tiny embedded image to
-// Gemini and returns the raw result, so you can see exactly what Gemini
+// GET /test runs a built-in self-test against Gemini (the scan flow).
+// GET /test?provider=llama runs the same kind of self-test against Meta's
+// Llama API (the solve flow), so you can see exactly what each service
 // says without involving the app or a camera.
 
 const MODEL = "gemini-2.5-flash";
+const LLAMA_MODEL = "Llama-4-Maverick-17B-128E-Instruct-FP8";
+const LLAMA_API_URL = "https://api.llama.com/v1/chat/completions";
 
 // 1x1 red pixel PNG, ~70 bytes. Used only by /test.
 const TEST_PNG =
@@ -71,6 +82,51 @@ async function callGemini(env, parts, generationConfig) {
   return { resp, raw, data };
 }
 
+// Meta's Llama API is OpenAI-compatible: chat completions with an
+// image_url content part for vision input, Bearer auth.
+async function callLlama(env, textPrompt, image, mimeType) {
+  const content = [{ type: "text", text: textPrompt }];
+  if (image) {
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:${mimeType || "image/jpeg"};base64,${image}` },
+    });
+  }
+  const resp = await fetch(LLAMA_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${env.LLAMA_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: LLAMA_MODEL,
+      messages: [{ role: "user", content }],
+      response_format: { type: "json_object" },
+    }),
+  });
+  const raw = await resp.text();
+  let data = null;
+  try { data = JSON.parse(raw); } catch (e) {}
+  return { resp, raw, data };
+}
+
+// Pulls the model's text out of an OpenAI-shaped chat completion response.
+// Meta's Llama API has used slightly different response shapes across
+// versions, so this checks the common ones defensively.
+function extractLlamaText(data) {
+  if (!data) return "";
+  const choice = data.choices && data.choices[0];
+  if (choice) {
+    if (typeof choice.message?.content === "string") return choice.message.content;
+    if (Array.isArray(choice.message?.content)) {
+      return choice.message.content.map((p) => p.text || "").join("");
+    }
+    if (typeof choice.text === "string") return choice.text;
+  }
+  if (data.completion_message?.content?.text) return data.completion_message.content.text;
+  return "";
+}
+
 export default {
   async fetch(request, env) {
     // CORS locked to the Pages origin - the Origin header browsers send is
@@ -85,6 +141,25 @@ export default {
 
     if (request.method === "GET") {
       const url = new URL(request.url);
+      if (url.pathname === "/test" && url.searchParams.get("provider") === "llama") {
+        if (!env.LLAMA_API_KEY) {
+          return json({ selftest: "FAIL", reason: "LLAMA_API_KEY secret is not set on this Worker" }, 200, cors);
+        }
+        try {
+          const { resp, raw } = await callLlama(env, 'Reply with exactly this JSON and nothing else: {"ok":true}');
+          return json({
+            selftest: resp.ok ? "OK" : "FAIL",
+            model: LLAMA_MODEL,
+            keyLength: env.LLAMA_API_KEY.length,
+            llamaStatus: resp.status,
+            llamaStatusText: resp.statusText,
+            llamaContentType: resp.headers.get("content-type"),
+            llamaBodyFirst800: raw.slice(0, 800),
+          }, 200, cors);
+        } catch (err) {
+          return json({ selftest: "FAIL", reason: "fetch to Llama threw: " + String(err) }, 200, cors);
+        }
+      }
       if (url.pathname === "/test") {
         if (!env.GEMINI_API_KEY) {
           return json({ selftest: "FAIL", reason: "GEMINI_API_KEY secret is not set on this Worker" }, 200, cors);
@@ -107,15 +182,11 @@ export default {
           return json({ selftest: "FAIL", reason: "fetch to Gemini threw: " + String(err) }, 200, cors);
         }
       }
-      return json({ error: "Send a POST request (or GET /test for a self-test)." }, 405, cors);
+      return json({ error: "Send a POST request (or GET /test, or GET /test?provider=llama, for a self-test)." }, 405, cors);
     }
 
     if (request.method !== "POST") {
       return json({ error: "Send a POST request." }, 405, cors);
-    }
-
-    if (!env.GEMINI_API_KEY) {
-      return json({ error: "Server misconfigured: the GEMINI_API_KEY secret is not set on this Worker. Run: npx wrangler secret put GEMINI_API_KEY, then redeploy." }, 500, cors);
     }
 
     let payload;
@@ -125,9 +196,17 @@ export default {
       return json({ error: "The photo upload arrived empty or corrupted (invalid request body). This usually means the upload was interrupted - retake the photo and try again." }, 400, cors);
     }
 
-    const { image, mimeType, prompt } = payload || {};
+    const { image, mimeType, prompt, mode } = payload || {};
     if (!image || typeof image !== "string") {
       return json({ error: "No image data was received. Retake the photo and try again." }, 400, cors);
+    }
+
+    if (mode === "solve") {
+      return handleSolve(env, image, mimeType, cors);
+    }
+
+    if (!env.GEMINI_API_KEY) {
+      return json({ error: "Server misconfigured: the GEMINI_API_KEY secret is not set on this Worker. Run: npx wrangler secret put GEMINI_API_KEY, then redeploy." }, 500, cors);
     }
 
     try {
@@ -188,6 +267,54 @@ export default {
     }
   },
 };
+
+// "Solve a question" - takes a photo of a single question a student is
+// stuck on, asks Meta's Llama API to identify it and solve it with a
+// short step-by-step explanation.
+async function handleSolve(env, image, mimeType, cors) {
+  if (!env.LLAMA_API_KEY) {
+    return json({ error: "Server misconfigured: the LLAMA_API_KEY secret is not set on this Worker. Run: npx wrangler secret put LLAMA_API_KEY, then redeploy." }, 500, cors);
+  }
+
+  const SOLVE_PROMPT = [
+    "A student photographed a question they're stuck on. Read the photo, find the single main question in it, and solve it.",
+    "Respond with JSON only, exactly matching this schema:",
+    '{"question": string, "answer": string, "steps": [string]}',
+    "- question: the question exactly as written in the photo, cleaned up (fix obvious OCR noise, keep the actual wording/numbers).",
+    "- answer: the final answer, short and direct (a number, a short phrase, or a sentence - whatever fits the question).",
+    "- steps: 2-6 short steps showing how to get from the question to the answer, in plain language a student can follow.",
+    "If the photo does not contain a clear, legible question (blank page, unrelated photo, too blurry to read), return exactly:",
+    '{"question":"","answer":"","steps":[]}',
+  ].join("\n");
+
+  try {
+    const { resp, raw, data } = await callLlama(env, SOLVE_PROMPT, image, mimeType || "image/jpeg");
+
+    if (!resp.ok) {
+      const detail = data && data.error && (data.error.message || data.error)
+        ? (data.error.message || JSON.stringify(data.error))
+        : (raw ? raw.slice(0, 200) : "empty body, statusText=" + resp.statusText);
+      return json({ error: `Llama rejected the request (HTTP ${resp.status}): ${detail}` }, 502, cors);
+    }
+    if (!data) {
+      return json({ error: `Llama returned an unreadable reply: ${raw.slice(0, 200)}` }, 502, cors);
+    }
+
+    const modelText = extractLlamaText(data);
+    let parsed = null;
+    try { parsed = JSON.parse(modelText); } catch (e) {}
+
+    if (parsed && typeof parsed.question === "string" && typeof parsed.answer === "string") {
+      const steps = Array.isArray(parsed.steps)
+        ? parsed.steps.filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim()).slice(0, 6)
+        : [];
+      return json({ question: parsed.question.trim(), answer: parsed.answer.trim(), steps }, 200, cors);
+    }
+    return json({ error: `Llama's reply didn't match the expected format: ${modelText.slice(0, 200)}` }, 502, cors);
+  } catch (err) {
+    return json({ error: "Worker error while solving: " + String(err) }, 500, cors);
+  }
+}
 
 function json(obj, status, cors) {
   return new Response(JSON.stringify(obj), {
