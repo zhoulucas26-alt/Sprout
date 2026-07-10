@@ -1,4 +1,4 @@
-// Sprout OCR + Solve proxy (Cloudflare Worker)
+// Sprout OCR + Solve + Flashcards proxy (Cloudflare Worker)
 // Keeps API keys server-side. The browser sends
 //   { image: "<base64>", mimeType: "image/jpeg", prompt?: "..." }
 // for the study-plan scan flow, and gets back
@@ -6,11 +6,16 @@
 // For the "Solve a question" flow it sends
 //   { mode: "solve", image: "<base64>", mimeType: "image/jpeg" }
 // and gets back { question, answer, steps: [...] } or { error }.
+// For "Flashcards" it sends the text already extracted by a previous scan
+// (no new photo needed):
+//   { mode: "flashcards", text: "<extracted study text>" }
+// and gets back { cards: [{front, back}, ...] } or { error }.
 //
-// Scan/OCR uses Gemini. Solve uses Meta's Llama 4 model (a separate key)
-// per explicit request to use Meta's model for that feature. Meta's own
-// Llama API isn't available in every region, so this calls Llama 4
-// hosted on Groq instead - same underlying Meta model, different host.
+// Scan/OCR uses Gemini. Solve and Flashcards use Meta's Llama 4 model (a
+// separate key) per explicit request to use Meta's model for those
+// features. Meta's own Llama API isn't available in every region, so this
+// calls Llama 4 hosted on Groq instead - same underlying Meta model,
+// different host.
 //
 // Keys are stored as Worker secrets (never in this file):
 //   npx wrangler secret put GEMINI_API_KEY
@@ -195,7 +200,12 @@ export default {
       return json({ error: "The photo upload arrived empty or corrupted (invalid request body). This usually means the upload was interrupted - retake the photo and try again." }, 400, cors);
     }
 
-    const { image, mimeType, prompt, mode } = payload || {};
+    const { image, mimeType, prompt, mode, text } = payload || {};
+
+    if (mode === "flashcards") {
+      return handleFlashcards(env, text, cors);
+    }
+
     if (!image || typeof image !== "string") {
       return json({ error: "No image data was received. Retake the photo and try again." }, 400, cors);
     }
@@ -312,6 +322,61 @@ async function handleSolve(env, image, mimeType, cors) {
     return json({ error: `Groq's reply didn't match the expected format: ${modelText.slice(0, 200)}` }, 502, cors);
   } catch (err) {
     return json({ error: "Worker error while solving: " + String(err) }, 500, cors);
+  }
+}
+
+// "Flashcards" - takes the text already extracted from a worksheet scan
+// (no new photo) and asks Meta's Llama 4 (hosted on Groq) to turn it into
+// a short set of front/back study flashcards.
+async function handleFlashcards(env, text, cors) {
+  if (!env.GROQ_API_KEY) {
+    return json({ error: "Server misconfigured: the GROQ_API_KEY secret is not set on this Worker. Run: npx wrangler secret put GROQ_API_KEY, then redeploy." }, 500, cors);
+  }
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return json({ error: "No study text to build flashcards from yet - scan a worksheet first." }, 400, cors);
+  }
+
+  const FLASHCARDS_PROMPT = [
+    "A student scanned a worksheet, and this is the text extracted from it. Turn it into a set of study flashcards.",
+    "Respond with JSON only, exactly matching this schema:",
+    '{"cards": [{"front": string, "back": string}]}',
+    "- 6-10 cards, each testing one key fact, term, or concept actually present in the text below.",
+    "- front: a short question or term (e.g. \"What is photosynthesis?\", \"Define mitosis\").",
+    "- back: a short, direct answer or definition (1-2 sentences max).",
+    "Do not invent facts that aren't supported by the text. If the text is too short or unclear to make good flashcards, return exactly:",
+    '{"cards":[]}',
+    "",
+    "STUDY MATERIAL:",
+    text.slice(0, 8000),
+  ].join("\n");
+
+  try {
+    const { resp, raw, data } = await callGroq(env, FLASHCARDS_PROMPT);
+
+    if (!resp.ok) {
+      const detail = data && data.error && (data.error.message || data.error)
+        ? (data.error.message || JSON.stringify(data.error))
+        : (raw ? raw.slice(0, 200) : "empty body, statusText=" + resp.statusText);
+      return json({ error: `Groq rejected the request (HTTP ${resp.status}): ${detail}` }, 502, cors);
+    }
+    if (!data) {
+      return json({ error: `Groq returned an unreadable reply: ${raw.slice(0, 200)}` }, 502, cors);
+    }
+
+    const modelText = extractGroqText(data);
+    let parsed = null;
+    try { parsed = JSON.parse(modelText); } catch (e) {}
+
+    if (parsed && Array.isArray(parsed.cards)) {
+      const cards = parsed.cards
+        .filter((c) => c && typeof c.front === "string" && typeof c.back === "string" && c.front.trim() && c.back.trim())
+        .map((c) => ({ front: c.front.trim(), back: c.back.trim() }))
+        .slice(0, 10);
+      return json({ cards }, 200, cors);
+    }
+    return json({ error: `Groq's reply didn't match the expected format: ${modelText.slice(0, 200)}` }, 502, cors);
+  } catch (err) {
+    return json({ error: "Worker error while building flashcards: " + String(err) }, 500, cors);
   }
 }
 
