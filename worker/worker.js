@@ -1,4 +1,4 @@
-// Sprout OCR + Solve + Flashcards proxy (Cloudflare Worker)
+// Sprout OCR + Solve + Flashcards + Practice proxy (Cloudflare Worker)
 // Keeps API keys server-side. The browser sends
 //   { image: "<base64>", mimeType: "image/jpeg", prompt?: "..." }
 // for the study-plan scan flow, and gets back
@@ -10,9 +10,13 @@
 // (no new photo needed):
 //   { mode: "flashcards", text: "<extracted study text>" }
 // and gets back { cards: [{front, back}, ...] } or { error }.
+// For "Practice quiz" it sends material pulled from something already done
+// (a past scan, a solved question, or a flashcard set - no new photo):
+//   { mode: "practice", text: "<study material>" }
+// and gets back { questions: [{question, options:[4], correctIndex, explanation}] } or { error }.
 //
-// Scan/OCR uses Gemini. Solve and Flashcards use Meta's Llama 4 model (a
-// separate key) per explicit request to use Meta's model for those
+// Scan/OCR and Practice use Gemini. Solve and Flashcards use Meta's Llama 4
+// model (a separate key) per explicit request to use Meta's model for those
 // features. Meta's own Llama API isn't available in every region, so this
 // calls Llama 4 hosted on Groq instead - same underlying Meta model,
 // different host.
@@ -206,6 +210,10 @@ export default {
       return handleFlashcards(env, text, cors);
     }
 
+    if (mode === "practice") {
+      return handlePractice(env, text, cors);
+    }
+
     if (!image || typeof image !== "string") {
       return json({ error: "No image data was received. Retake the photo and try again." }, 400, cors);
     }
@@ -377,6 +385,80 @@ async function handleFlashcards(env, text, cors) {
     return json({ error: `Groq's reply didn't match the expected format: ${modelText.slice(0, 200)}` }, 502, cors);
   } catch (err) {
     return json({ error: "Worker error while building flashcards: " + String(err) }, 500, cors);
+  }
+}
+
+// "Practice quiz" - takes material pulled from something already done (a
+// past scan's extracted text, a solved question, or a flashcard set - no
+// new photo) and asks Gemini to build a short multiple-choice quiz from it.
+async function handlePractice(env, text, cors) {
+  if (!env.GEMINI_API_KEY) {
+    return json({ error: "Server misconfigured: the GEMINI_API_KEY secret is not set on this Worker. Run: npx wrangler secret put GEMINI_API_KEY, then redeploy." }, 500, cors);
+  }
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return json({ error: "Not enough material to build a quiz from yet." }, 400, cors);
+  }
+
+  const QUIZ_PROMPT = [
+    "A student wants to be quizzed on material from something they already did (a scanned worksheet, a solved question, or a set of flashcards). Build a short multiple-choice quiz from the text below.",
+    "Respond with JSON only, exactly matching this schema:",
+    '{"questions": [{"question": string, "options": [string, string, string, string], "correctIndex": number, "explanation": string}]}',
+    "- 4-6 questions, each testing understanding of one fact, term, or concept actually present in the text below - do not invent facts it doesn't support.",
+    "- options: exactly 4 plausible answers, only one clearly correct.",
+    "- correctIndex: the 0-based index (0-3) of the correct option.",
+    "- explanation: one short sentence on why that answer is correct.",
+    "If the text is too short or unclear to make a real quiz from, return exactly:",
+    '{"questions":[]}',
+    "",
+    "MATERIAL:",
+    text.slice(0, 8000),
+  ].join("\n");
+
+  try {
+    const { resp, raw, data } = await callGemini(env, [
+      { text: QUIZ_PROMPT },
+    ], { response_mime_type: "application/json" });
+
+    if (!resp.ok) {
+      const detail = data && data.error && data.error.message
+        ? data.error.message
+        : (raw ? raw.slice(0, 200) : "empty body, statusText=" + resp.statusText);
+      return json({ error: `Gemini rejected the request (HTTP ${resp.status}): ${detail}` }, 502, cors);
+    }
+    if (!data) {
+      return json({ error: `Gemini returned an unreadable reply: ${raw.slice(0, 200)}` }, 502, cors);
+    }
+
+    const cand = data.candidates && data.candidates[0];
+    if (!cand) {
+      const block = data.promptFeedback && data.promptFeedback.blockReason;
+      return json({ error: block ? `Gemini declined to process the request (${block}).` : "Gemini returned no result for this material." }, 502, cors);
+    }
+
+    const modelText = (cand.content && cand.content.parts || []).map((p) => p.text || "").join("");
+    let parsed = null;
+    try { parsed = JSON.parse(modelText); } catch (e) {}
+
+    if (parsed && Array.isArray(parsed.questions)) {
+      const questions = parsed.questions
+        .filter((q) =>
+          q && typeof q.question === "string" && q.question.trim() &&
+          Array.isArray(q.options) && q.options.length >= 2 && q.options.length <= 4 &&
+          q.options.every((o) => typeof o === "string" && o.trim()) &&
+          Number.isInteger(q.correctIndex) && q.correctIndex >= 0 && q.correctIndex < q.options.length
+        )
+        .map((q) => ({
+          question: q.question.trim(),
+          options: q.options.map((o) => o.trim()),
+          correctIndex: q.correctIndex,
+          explanation: typeof q.explanation === "string" ? q.explanation.trim() : "",
+        }))
+        .slice(0, 6);
+      return json({ questions }, 200, cors);
+    }
+    return json({ error: `Gemini's reply didn't match the expected format: ${modelText.slice(0, 200)}` }, 502, cors);
+  } catch (err) {
+    return json({ error: "Worker error while building the quiz: " + String(err) }, 500, cors);
   }
 }
 
