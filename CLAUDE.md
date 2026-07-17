@@ -2,11 +2,14 @@
 
 Sprout is a study-planner web app: the user photographs a worksheet, Gemini
 reads it, and the app shows the extracted text, a summary, and detected
-subject cards, then builds a (currently still hardcoded) study plan.
+subject cards, then builds a study plan from the real scan. Camera scan
+(study plan) and Practice quiz run on Gemini; Solve a question and
+Flashcards run on Meta's Llama 4 (hosted on Groq) — **two separate API
+keys are required for the app to fully work**, see "The Worker" below.
 
 - **Live site**: https://zhoulucas26-alt.github.io/Sprout/ (GitHub Pages)
 - **Repo**: zhoulucas26-alt/Sprout, default branch `main`
-- **OCR backend**: Cloudflare Worker at
+- **OCR/AI backend**: Cloudflare Worker at
   `https://sprout-ocr.sprout-zhoulucas26.workers.dev` (source in `worker/`)
 
 ## Repo layout
@@ -14,7 +17,7 @@ subject cards, then builds a (currently still hardcoded) study plan.
 | Path | What it is |
 |---|---|
 | `index.html` | The entire app, as a single self-contained "bundled page" (~500KB). See editing rules below — this file is fragile. |
-| `worker/worker.js` | Cloudflare Worker: holds the Gemini key, accepts a base64 photo, returns `{text, summary, subjects}` or `{error}`. `GET /test` is a built-in self-test that reports Gemini's raw verdict. |
+| `worker/worker.js` | Cloudflare Worker: holds both the Gemini and Groq keys. Scan (study plan) and Practice quiz call Gemini; Solve a question and Flashcards call Groq (Llama 4). Returns mode-specific JSON or `{error}`. `GET /test` self-tests Gemini; `GET /test?provider=groq` self-tests Groq — both report the raw upstream verdict. |
 | `worker/wrangler.toml` | Worker config (name `sprout-ocr`). |
 | `manifest.json`, `icons/` | PWA/homescreen support (iOS Add to Home Screen works). |
 | `.github/workflows/static.yml` | Deploys repo root to GitHub Pages on every push to `main`. |
@@ -67,18 +70,34 @@ React 18.3.1, ReactDOM, and @babel/standalone 7.29.0 from unpkg.com.
   "Scan my work" → shutter is `button[style*="78px"]` (force:true clicks;
   animations make elements "unstable" to Playwright).
 
-## The Worker (Gemini proxy)
+## The Worker (Gemini + Groq proxy)
 
-- Model: `gemini-2.5-flash` via `generativelanguage.googleapis.com`
+**Two independent secrets are required — the app is only half-working if
+either one is missing, and there's no error banner in the UI warning the
+user of this, only a per-feature "reported a problem" message.** This bit
+Sprout once already: Solve and Flashcards silently 500'd on every single
+use because GROQ_API_KEY was never set, and this file only ever documented
+GEMINI_API_KEY. If a user reports "the AI bugs out a lot" or specific
+features (especially Solve/Flashcards) always fail, check secrets FIRST
+before debugging anything else.
+
+- **Gemini** (`gemini-2.5-flash`, `generativelanguage.googleapis.com`
   v1beta `generateContent`, key in header `x-goog-api-key`, structured
-  output via `generationConfig.response_mime_type: "application/json"`.
-- Secret `GEMINI_API_KEY` — set by the USER on their machine with
-  `npx wrangler secret put GEMINI_API_KEY`. Claude never sees the key.
-  If OCR fails oddly, have the user open `/test` — it reports `keyLength`
-  and Gemini's raw response. (A past outage: keyLength was 1 because a
-  paste into the hidden prompt failed. Real keys are ~39 chars.)
-- CORS is currently `*` (fine for demo; locking to the Pages origin is a
-  known TODO).
+  output via `generationConfig.response_mime_type: "application/json"`)
+  powers the **scan → study plan flow** and **Practice quiz**.
+  Secret `GEMINI_API_KEY`, self-test at `/test`.
+- **Groq** (hosting Meta's `meta-llama/llama-4-maverick-17b-128e-instruct`,
+  OpenAI-compatible chat-completions API, Bearer auth, structured output
+  via `response_format: {type:"json_object"}`) powers **Solve a question**
+  and **Flashcards**. Secret `GROQ_API_KEY` (get one free at
+  console.groq.com/keys), self-test at `/test?provider=groq`.
+- Both secrets are set by the USER on their machine with
+  `npx wrangler secret put GEMINI_API_KEY` / `npx wrangler secret put GROQ_API_KEY`.
+  Claude never sees either key. Each self-test endpoint reports `keyLength`
+  and the raw upstream response — have the user open the relevant one when
+  a feature "bugs out". (A past outage: keyLength was 1 because a paste
+  into the hidden prompt failed. Real keys are much longer than that.)
+- CORS is locked to `https://zhoulucas26-alt.github.io` (the Pages origin).
 - Claude cannot deploy or call the Worker from the sandbox. The user
   deploys from **Windows PowerShell** in their local `sprout-ocr` folder:
   ```powershell
@@ -102,15 +121,17 @@ React 18.3.1, ReactDOM, and @babel/standalone 7.29.0 from unpkg.com.
 
 ## Current state / known TODOs
 
-Working end to end: camera scan → downscale to 1600px → Worker → Gemini →
-extracted text + summary + real detected subject cards; failure shows a
-"Failed to read the photo" screen with the specific reason and a Retake
-photo button.
+Working end to end, each with its own failure screen and Retake/Retry path:
+camera scan → study plan built from the real detected subjects, Solve a
+question, Flashcards (from a scan), Practice quiz (from a scan/solve/
+flashcards), History, coins/Shop cosmetics (frames/backgrounds/accessories),
+Achievements with unlock toasts, and tiered Plans (free/plus/pro).
 
 Still mock/demo:
-1. **The study plan blocks** (Biology/Algebra/History sequence in
-   `content(kind)` / `seq(h)` in the template component) ignore the scan.
-   Next feature: generate plan blocks from the detected subjects (likely a
-   second Gemini call or an extended schema in the existing one).
-2. Pricing plans, streaks, and fast demo timer are demo furniture.
-3. CORS lockdown on the Worker (one line, needs Worker redeploy).
+1. Pricing-tier gating (scan cap, streak multipliers) and the fast demo
+   session timer are real logic but tuned for demoing, not tested pricing.
+2. No in-app warning if a Worker secret is missing — each affected feature
+   just shows its own "reported a problem" error per attempt. If a whole
+   feature (not just one bad scan) always fails, check the relevant
+   self-test endpoint (`/test` or `/test?provider=groq`) before assuming
+   it's a frontend bug.
