@@ -121,6 +121,18 @@ async function callGroq(env, textPrompt, image, mimeType) {
   return { resp, raw, data };
 }
 
+// Models asked for raw JSON occasionally wrap it in a markdown code fence
+// anyway (```json ... ``` or ``` ... ```) despite response_mime_type /
+// response_format instructions. Strip that before parsing so a harmless
+// formatting quirk doesn't surface as "reply didn't match expected format".
+function parseModelJson(text) {
+  if (typeof text !== "string") return null;
+  let t = text.trim();
+  const fenced = t.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) t = fenced[1].trim();
+  try { return JSON.parse(t); } catch (e) { return null; }
+}
+
 // Pulls the model's text out of an OpenAI-shaped chat completion response.
 function extractGroqText(data) {
   if (!data) return "";
@@ -269,8 +281,7 @@ export default {
       // The model was asked for JSON; parse it and pass structure through.
       // If parsing fails, fall back to treating its output as plain text so
       // the app still gets something usable.
-      let parsed = null;
-      try { parsed = JSON.parse(modelText); } catch (e) {}
+      let parsed = parseModelJson(modelText);
       if (parsed && typeof parsed.extractedText === "string") {
         return json({
           text: parsed.extractedText,
@@ -318,8 +329,7 @@ async function handleSolve(env, image, mimeType, cors) {
     }
 
     const modelText = extractGroqText(data);
-    let parsed = null;
-    try { parsed = JSON.parse(modelText); } catch (e) {}
+    let parsed = parseModelJson(modelText);
 
     if (parsed && typeof parsed.question === "string" && typeof parsed.answer === "string") {
       const steps = Array.isArray(parsed.steps)
@@ -372,8 +382,7 @@ async function handleFlashcards(env, text, cors) {
     }
 
     const modelText = extractGroqText(data);
-    let parsed = null;
-    try { parsed = JSON.parse(modelText); } catch (e) {}
+    let parsed = parseModelJson(modelText);
 
     if (parsed && Array.isArray(parsed.cards)) {
       const cards = parsed.cards
@@ -436,8 +445,7 @@ async function handlePractice(env, text, cors) {
     }
 
     const modelText = (cand.content && cand.content.parts || []).map((p) => p.text || "").join("");
-    let parsed = null;
-    try { parsed = JSON.parse(modelText); } catch (e) {}
+    let parsed = parseModelJson(modelText);
 
     if (parsed && Array.isArray(parsed.questions)) {
       const questions = parsed.questions
